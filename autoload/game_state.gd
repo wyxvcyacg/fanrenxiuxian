@@ -82,7 +82,8 @@ func return_element(elt: String) -> bool:
 	return true
 
 
-## 每年修炼获得的修为：主灵根 × 8，若是纯单灵根再 +8（资质更纯更快）。
+## 每年修炼获得的修为：主灵根 × 8，若是纯单灵根再 +8（资质更纯更快），
+## 再加主修功法的额外加成。
 ## 主灵根为 0 时返回 0（还没分配灵根，无法修炼）。
 func cultivation_per_year() -> int:
 	var me := player.main_element()
@@ -91,6 +92,7 @@ func cultivation_per_year() -> int:
 	var eff := int(me[1]) * 8
 	if player.is_pure_root():
 		eff += 8
+	eff += int(active_gongfa().get("cult_per_year", 0))
 	return eff
 
 
@@ -114,28 +116,76 @@ func has_enough_element() -> bool:
 	return me >= int(current_realm().min_element)
 
 
-## 尝试突破当前境界。需要：非最高境界 + 未坐化 + 修为满 + 灵石足 + 主灵根达标。
-## 成功返回 true，否则 false。
-func try_breakthrough() -> bool:
-	if is_max_realm():
-		return false
-	if is_dead():
-		return false
-	var cfg: Dictionary = current_realm()
-	if player.cultivation < cfg.need:
-		return false
-	if player.spirit_stones < cfg.cost:
-		return false
-	if player.main_element()[1] < int(cfg.min_element):
-		return false
+## 基础突破成功率（%），不含丹药加成。
+## 与主灵根成正比，纯灵根再高一层。这是“风险”的来源：不再是达标即成功。
+func breakthrough_rate() -> int:
+	var me := player.main_element()[1]
+	var rate := 40 + me * 8
+	if player.is_pure_root():
+		rate += 10
+	return clampi(rate, 0, 95)
 
-	# 突破成功：进境、清空修为、扣灵石、大幅延长寿元。
-	player.realm += 1
-	player.cultivation = 0
-	player.spirit_stones -= cfg.cost
-	player.lifespan = REALMS[player.realm].lifespan
+
+## 尝试突破当前境界。
+## 需要：非最高境界 + 未坐化 + 修为满 + 灵石足 + 主灵根达标（缺一即 locked 直接返回）。
+##
+## 突破改成“看脸”——不再是达标即成功：
+##   - 成功率为 breakthrough_rate()；若持有凝神丹会自动服用，再 +20%。
+##   - 失败 = 走火入魔：损失三成修为；另有 5% 概率跌落境界（道基不稳）。
+##     若持有洗髓丹会自动服用，护住道基不跌落。
+##
+## 返回结果字典：
+##   ok / locked / success_rate / used_bonus / used_protect /
+##   dropped（是否跌境）/ lose_cult（走的修为）/ success（内部冗余，含在 ok）
+func try_breakthrough() -> Dictionary:
+	if is_max_realm() or is_dead():
+		return { "ok": false, "locked": true }
+	var cfg: Dictionary = current_realm()
+	if player.cultivation < cfg.need \
+			or player.spirit_stones < cfg.cost \
+			or player.main_element()[1] < int(cfg.min_element):
+		return { "ok": false, "locked": true }
+
+	# 基础成功率 + 自动服用凝神丹加成
+	var rate := breakthrough_rate()
+	var used_bonus := false
+	if count_pill("凝神丹") > 0:
+		consume_pill("凝神丹")
+		rate += int(Pills.def("凝神丹").get("breakthrough_bonus", 0))
+		used_bonus = true
+
+	# 判定成败
+	if randi() % 100 < rate:
+		player.realm += 1
+		player.cultivation = 0
+		player.spirit_stones -= int(cfg.cost)
+		player.lifespan = REALMS[player.realm].lifespan
+		notify_change()
+		return { "ok": true, "locked": false, "success_rate": rate, "used_bonus": used_bonus }
+
+	# 失败：走火入魔，损失三成修为
+	var lose_cult := int(player.cultivation * 0.3)
+	player.cultivation = maxi(player.cultivation - lose_cult, 0)
+
+	# 5% 概率道基不稳、跌落境界；洗髓丹可护道基
+	var dropped := false
+	var used_protect := false
+	if randi() % 20 == 0 and player.realm > 0:
+		if count_pill("洗髓丹") > 0:
+			consume_pill("洗髓丹")
+			used_protect = true
+		else:
+			player.realm -= 1
+			player.lifespan = REALMS[player.realm].lifespan
+			player.cultivation = maxi(player.cultivation, int(REALMS[player.realm].need))
+			dropped = true
+
 	notify_change()
-	return true
+	return {
+		"ok": false, "locked": false,
+		"success_rate": rate, "used_bonus": used_bonus,
+		"used_protect": used_protect, "dropped": dropped, "lose_cult": lose_cult,
+	}
 
 
 ## 战斗结算：把一场战斗的胜负结果写入长期成长数据。
@@ -160,3 +210,250 @@ func apply_battle_result(win: bool) -> Dictionary:
 		out = { "win": false, "lost_stones": lost_stones, "died": is_dead() }
 	notify_change()
 	return out
+
+
+# ============================================================================
+#  法宝 / 背包
+# ============================================================================
+## 背包里是否已持有指定法宝。
+func has_fabao(id: String) -> bool:
+	return int(player.inventory.get(id, 0)) > 0
+
+
+## 当前装备的法宝模板；未装备返回 Items.EMPTY_FABAO。
+## 归一化入口：战斗/UI 都从这里取，保证 id 必定对得上模板。
+func equipped_fabao() -> Dictionary:
+	return Items.def(player.fabao)
+
+
+## 批量法宝加成（供战斗等场景一次性读取，避免多次取模板）。
+func fabao_bonus() -> Dictionary:
+	var d := equipped_fabao()
+	return { "atk": int(d.get("atk_bonus", 0)), "hp": int(d.get("hp_bonus", 0)) }
+
+
+## 购买法宝：需灵石足够且尚未拥有。成功扣灵石并入背包，返回是否成功。
+func buy_fabao(id: String) -> bool:
+	var d: Dictionary = Items.FABAO.get(id)
+	if d.is_empty():
+		return false
+	if has_fabao(id):
+		return false
+	var cost := int(d.get("cost", 0))
+	if player.spirit_stones < cost:
+		return false
+	player.spirit_stones -= cost
+	player.inventory[id] = 1
+	notify_change()
+	return true
+
+
+## 无条件把一件法宝放入背包（用于战斗掉落等免费途径）。已拥有则失败。
+func grant_fabao(id: String) -> bool:
+	if Items.FABAO.has(id) and not has_fabao(id):
+		player.inventory[id] = 1
+		notify_change()
+		return true
+	return false
+
+
+## 装备一件已拥有的法宝。返回是否成功。
+func equip_fabao(id: String) -> bool:
+	if not has_fabao(id):
+		return false
+	player.fabao = id
+	notify_change()
+	return true
+
+
+## 卸下当前法宝。无论是否装备都返回 true（幂等）。
+func unequip_fabao() -> void:
+	player.fabao = ""
+	notify_change()
+
+
+# ============================================================================
+#  功法 / 神通
+# ============================================================================
+## 是否已习得指定功法。
+func has_technique(id: String) -> bool:
+	return int(player.techniques.get(id, 0)) > 0
+
+
+## 当前主修功法模板；未主修返回空字典。
+func active_gongfa() -> Dictionary:
+	return Techniques.def(player.active_gongfa)
+
+
+## 习得功法：需灵石足够 + 境界达标 + 尚未习得。成功扣灵石并入库，返回是否成功。
+func learn_technique(id: String) -> bool:
+	var d: Dictionary = Techniques.def(id)
+	if d.is_empty() or has_technique(id):
+		return false
+	if int(d.get("realm_min", 0)) > player.realm:
+		return false
+	if player.spirit_stones < int(d.get("cost", 0)):
+		return false
+	player.spirit_stones -= int(d.get("cost", 0))
+	player.techniques[id] = 1
+	notify_change()
+	return true
+
+
+## 把一门已习得的功法设为主修。返回是否成功。
+func set_gongfa(id: String) -> bool:
+	if not has_technique(id):
+		return false
+	if player.active_gongfa == id:
+		return false
+	player.active_gongfa = id
+	notify_change()
+	return true
+
+
+## 无条件获得一门功法（剧情奇遇等免费途径，不扣灵石）。
+func grant_technique(id: String) -> bool:
+	if Techniques.def(id).is_empty() or has_technique(id):
+		return false
+	player.techniques[id] = 1
+	notify_change()
+	return true
+
+
+# ============================================================================
+#  剧情奇遇 / 事件结算
+# ============================================================================
+## 把一个“事件选择的结果”写入长期数据。effect 字典支持的键：
+##   stones(±) / age(+)/ lifespan(±) / cultivation(+)
+##   pill(发丹药) + pill_count / gongfa(赠功法) / fabao(赠法宝)
+## 返回本次变更的人类可读摘要（供地块 UI 展示），无变化返回空串。
+## 注意：这里不处理 battle 效果——遇到战斗需由调用方切换战斗场景。
+func apply_event_outcome(effect: Dictionary) -> String:
+	var p := player
+	var parts: Array[String] = []
+	if effect.has("stones"):
+		p.spirit_stones = maxi(p.spirit_stones + int(effect["stones"]), 0)
+		parts.append("灵石%+d" % int(effect["stones"]))
+	if effect.has("age"):
+		var y := maxi(int(effect["age"]), 0)
+		p.age += y
+		if y > 0:
+			parts.append("虚耗%+d年寿元" % (-y))
+	if effect.has("lifespan"):
+		var l := int(effect["lifespan"])
+		p.lifespan = maxi(p.lifespan + l, 1)
+		parts.append("寿元上限%+d" % l)
+	if effect.has("cultivation"):
+		p.cultivation = maxi(p.cultivation + int(effect["cultivation"]), 0)
+		parts.append("修为%+d" % int(effect["cultivation"]))
+	if effect.has("pill"):
+		var pid := str(effect["pill"])
+		var cnt := int(effect.get("pill_count", 1))
+		grant_pill(pid, cnt)
+		parts.append("丹药×%d·%s" % [cnt, Pills.def(pid).get("name", pid)])
+	if effect.has("gongfa"):
+		var gid := str(effect["gongfa"])
+		if grant_technique(gid):
+			parts.append("习得功法·%s" % Techniques.def(gid).get("name", gid))
+	if effect.has("fabao"):
+		var fid := str(effect["fabao"])
+		if grant_fabao(fid):
+			parts.append("获法宝·%s" % Items.def(fid).get("name", fid))
+	notify_change()
+	return "、".join(parts)
+
+
+# ============================================================================
+#  丹药 / 消耗品
+# ============================================================================
+## 当前拥有的某味丹药数量。
+func count_pill(id: String) -> int:
+	return int(player.pills.get(id, 0))
+
+
+## 是否持有至少一枚某味丹药。
+func has_pill(id: String) -> bool:
+	return count_pill(id) > 0
+
+
+## 购买丹药：需灵石足够且存在该模板。成功扣灵石并加一枚，返回是否成功。
+func buy_pill(id: String) -> bool:
+	if Pills.def(id).is_empty():
+		return false
+	var cost := int(Pills.def(id).get("cost", 0))
+	if player.spirit_stones < cost:
+		return false
+	player.spirit_stones -= cost
+	player.pills[id] = count_pill(id) + 1
+	notify_change()
+	return true
+
+
+## 无条件发放丹药（奇遇/掉落等免费途径）。
+func grant_pill(id: String, amount: int = 1) -> void:
+	if Pills.def(id).is_empty() or amount <= 0:
+		return
+	player.pills[id] = count_pill(id) + amount
+	notify_change()
+
+
+## 消耗一枚丹药（战斗吞服 / 突破自动服用等）。数量不足返回 false。
+func consume_pill(id: String) -> bool:
+	var n := count_pill(id)
+	if n <= 0:
+		return false
+	if n == 1:
+		player.pills.erase(id)
+	else:
+		player.pills[id] = n - 1
+	notify_change()
+	return true
+
+
+# ============================================================================
+#  坐化传承（转世重修）
+# ============================================================================
+## 开始一世“传世”：从当前（已坐化）的角色继承部分遗产，新开一世。
+## 继承规则：三成灵石、随机一门已习得功法、持有的丹药每味最多带 2 枚、
+##           随机一件已拥有法宝。灵根 / 境界 / 寿元等重置为新档（需重新分配灵根）。
+## 返回本次继承的人类可读摘要。
+func start_new_life() -> String:
+	var old := player
+	var np := PlayerData.new()
+
+	var parts: Array[String] = []
+
+	# 三成灵石
+	var stones := int(old.spirit_stones * 0.3)
+	np.spirit_stones = stones
+	if stones > 0:
+		parts.append("继承灵石 %d" % stones)
+
+	# 随机一门已习得的功法（沿用为“已习得”，不自动主修）
+	var gids: Array = old.techniques.keys()
+	if not gids.is_empty():
+		var gid := str(gids[randi() % gids.size()])
+		np.techniques[gid] = 1
+		parts.append("沿用功法·%s" % Techniques.def(gid).get("name", gid))
+
+	# 丹药：每味最多带 2 枚
+	for pid in old.pills:
+		if Pills.def(str(pid)).is_empty():
+			continue
+		var keep := mini(int(old.pills[pid]), 2)
+		if keep > 0:
+			np.pills[pid] = keep
+			parts.append("%s×%d" % [Pills.def(str(pid)).get("name", str(pid)), keep])
+
+	# 随机一件已拥有法宝（留作传家宝）
+	var fids: Array = old.inventory.keys()
+	if not fids.is_empty():
+		var fid := str(fids[randi() % fids.size()])
+		np.inventory[fid] = 1
+		parts.append("传法宝·%s" % Items.def(fid).get("name", fid))
+
+	# 落档并通知 UI
+	player = np
+	SaveSystem.save_player(player)
+	notify_change()
+	return "、".join(parts) if not parts.is_empty() else "这一次，你两手空空地重入轮回……"
