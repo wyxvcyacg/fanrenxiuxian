@@ -1,0 +1,27 @@
+; Engine configuration file.
+; It's best edited using the editor UI and not directly,
+; This is a Godot 4 project for a mobile cultivation (xiuzhen) demo.
+
+config_version=5
+
+[application]
+
+config/name="修仙修炼录"
+config/description="一个用于学习 Godot 的最小可玩修仙循环：时间流逝 + 修炼 + 境界突破 + 存档。"
+run/main_scene="res://main/main.tscn"
+config/features=PackedStringArray("4.3", "Mobile")
+config/icon="res://icon.svg"
+
+[autoload]
+
+; 全局单例注册。start=*res://... 后面的 * 表示在路径前自动 new 一个实例并加入场景树。
+GameState="*res://autoload/game_state.gd"
+SaveSystem="*res://autoload/save_system.gd"
+
+[display]
+
+; 竖屏手机风格，采用画布拉伸(CanvasItem)并等比例铺满，方便以后导出到手机。
+window/size/viewport_width=720
+window/size/viewport_height=1280
+window/stretch/mode="canvas_items"
+window/stretch/aspect="expand"
