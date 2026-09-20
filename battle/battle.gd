@@ -26,6 +26,8 @@ var _enemy: Fighter
 var _state: String = "player"
 ## 玩家本命灵根名（战斗内不再改变）
 var _root: String = ""
+## 法宝攻击加成：装备的五行术法威力加成（战斗中不变）
+var _fabao_atk: int = 0
 
 ## 控件引用
 var _lbl_ptitle: Label
@@ -53,8 +55,11 @@ func _init_fighters() -> void:
 	var p: PlayerData = GameState.player
 	_root = str(p.main_element()[0]) if int(p.main_element()[1]) > 0 else ""
 
-	# 玩家：HP/灵气上限随境界成长
-	_player = Fighter.new("你", 60 + p.realm * 30, 60 + p.realm * 20, _root)
+	# 玩家：HP/灵气上限随境界成长；若已装备法宝，气血上限再加 hp_bonus
+	var bonus := GameState.fabao_bonus()
+	_player = Fighter.new("你", 60 + p.realm * 30 + int(bonus["hp"]), 60 + p.realm * 20, _root)
+	# 法宝攻击加成：作用于五行术法伤害
+	_fabao_atk = int(bonus["atk"])
 
 	# 敌修：强度随玩家境界成长，本命五行随机一个
 	var e := PlayerData.ELEMENTS[randi() % PlayerData.ELEMENTS.size()]
@@ -112,9 +117,11 @@ func _build_ui() -> void:
 	_mk_gap(vbox)
 	_mk_caption2(vbox, "行动")
 
-	# 操作区（玩家回合的行动按钮）
-	_action_row = HBoxContainer.new()
-	_action_row.add_theme_constant_override("separation", 8)
+	# 操作区（玩家回合的行动按钮），3 列网格避免按钮过多时横向溢出
+	_action_row = GridContainer.new()
+	_action_row.columns = 3
+	_action_row.add_theme_constant_override("h_separation", 8)
+	_action_row.add_theme_constant_override("v_separation", 8)
 	_action_row.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	vbox.add_child(_action_row)
 	_build_player_actions()
@@ -153,6 +160,17 @@ func _build_player_actions() -> void:
 		if int(GameState.player.elements[e]) <= 0:
 			continue
 		_mk_action("%s·术(-30)" % e, _act_spell.bind(e))
+	# 主修功法：若有，解锁其专属神通
+	var gf: Dictionary = GameState.active_gongfa()
+	if not gf.is_empty():
+		_mk_action("神通·%s(-%d)" % [gf["spell_name"], int(gf["spell_cost_qi"])], _act_gongfa)
+	# 战斗丹药：有回血/回气/护盾效果的丹药，在战斗内可吞服（占用一回合）
+	for pid in GameState.player.pills:
+		if GameState.count_pill(pid) <= 0:
+			continue
+		var pd: Dictionary = Pills.def(pid)
+		if int(pd.get("heal_hp", 0)) > 0 or int(pd.get("heal_qi", 0)) > 0 or int(pd.get("shield", 0)) > 0:
+			_mk_action("用·%s×%d" % [pd["name"], GameState.count_pill(pid)], _act_pill.bind(pid))
 
 
 func _mk_action(text: String, target: Callable) -> void:
@@ -277,15 +295,23 @@ func _finish_battle() -> void:
 
 	var win: bool = _enemy.is_down() and not _player.is_down()
 	var r: Dictionary = GameState.apply_battle_result(win)
-	SaveSystem.save_player(GameState.player)
 
 	if win:
 		_log("\n★ 你击败了敌修！")
 		_lbl_result.text = "★ 大捷！\n修为 +%d，灵石 +%d" % [int(r["cultivation"]), int(r["stones"])]
+		# 小概率击败散修缴获其护身法宝（已拥有则不会重复获得）
+		if randi() % 4 == 0:
+			var all_ids := Items.FABAO.keys()
+			var loot: String = str(all_ids[randi() % all_ids.size()])
+			if GameState.grant_fabao(loot):
+				_lbl_result.text += "\n你从散修身上搜得「%s」一件！" % Items.def(loot)["name"]
 	elif r["died"]:
 		_lbl_result.text = "你重伤不支，寿元走到尽头……坐化道消。"
 	else:
 		_lbl_result.text = "你重伤落败，仓皇遁走。\n修为折半，损失灵石 %d，虚耗五年寿元。" % int(r["lost_stones"])
+
+	# 结算（含可能的掉落）后再落档，确保新法宝一并保存
+	SaveSystem.save_player(GameState.player)
 
 	var back := Button.new()
 	back.text = "返回"
@@ -337,11 +363,58 @@ func _act_spell(e: String) -> void:
 	if not _pay(30):
 		return
 	var pt := int(GameState.player.elements[e])
-	var raw := 12 + pt * 4 + GameState.player.realm * 2
+	var raw := 12 + pt * 4 + GameState.player.realm * 2 + _fabao_atk
 	_log("你催动「%s」系术法，灵光破空！" % e)
 	var r := _apply_damage(_player, _enemy, raw, e)
 	_log("命中：本体检伤 %d%s。" % [r["dmg"], "（相克！）" if r["crit"] else ""])
 	_after_player_attack()
+
+
+## 主修功法的专属神通：威力高于普通术法，并叠加法宝攻击加成。
+## 以玩家本命灵根判定相克，本命未定则无相克。
+func _act_gongfa() -> void:
+	if _state != "player":
+		return
+	var gf: Dictionary = GameState.active_gongfa()
+	if gf.is_empty():
+		return
+	if not _pay(int(gf["spell_cost_qi"])):
+		return
+	var raw := int(gf["spell_base"]) + GameState.player.realm * 3 + _fabao_atk
+	_log("你催动主修功法，祭出神通「%s」！" % gf["spell_name"])
+	var r := _apply_damage(_player, _enemy, raw, _root)
+	_log("命中：本体检伤 %d%s。" % [r["dmg"], "（相克！）" if r["crit"] else ""])
+	_after_player_attack()
+
+
+## 吞服一枚战斗丹药（回血/回气/护盾），消耗一份，占用一回合。
+## 突破丹药（凝神丹/洗髓丹）在战斗内不可服用，只能在闭关突破时自动生效。
+func _act_pill(id: String) -> void:
+	if _state != "player":
+		return
+	if GameState.count_pill(id) <= 0:
+		_log("你带的那味丹药已经用完了。")
+		return
+	var pd: Dictionary = Pills.def(id)
+	var h := int(pd.get("heal_hp", 0))
+	var q := int(pd.get("heal_qi", 0))
+	var s := int(pd.get("shield", 0))
+	if h <= 0 and q <= 0 and s <= 0:
+		_log("这味丹药需在闭关突破时服用。（%s）" % pd.get("name", ""))
+		return
+	if not GameState.consume_pill(id):
+		return
+	if h > 0:
+		_player.hp = mini(_player.hp + h, _player.max_hp)
+	if q > 0:
+		_player.gain_qi(q)
+	if s > 0:
+		_player.gain_shield(s)
+	_log("你吞下「%s」，药力化作灵光流转周身。" % pd.get("name", id))
+	_refresh()
+	if _over():
+		return
+	_start_enemy_turn()
 
 
 ## 玩家攻击之后：判定敌方倒下，否则进入敌人回合。

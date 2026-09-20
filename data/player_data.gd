@@ -23,6 +23,18 @@ var spirit_stones: int = 50
 ## 五行灵根点数：每项 0~5，总和不超过 GameState.TOTAL_ELEMENT_POINTS。
 ## 主灵根(最高单项)决定修炼效率，并约束能否冲击高境界。
 var elements: Dictionary = {}
+## 背包：法宝 id -> 拥有数量。
+var inventory: Dictionary = {}
+## 当前已装备的法宝 id；空串表示未装备。
+## 战斗读取加成时请走 GameState.equipped_fabao()，以保证返回的是合法模板。
+var fabao: String = ""
+## 已习得的功法 id 集合（id -> 1）。
+var techniques: Dictionary = {}
+## 当前主修功法 id；空串表示未主修任何功法。
+## 主修功法影响修炼效率，并在战斗解锁专属神通。读取请走 GameState.active_gongfa()。
+var active_gongfa: String = ""
+## 丹药背包：丹药 id -> 数量。
+var pills: Dictionary = {}
 
 
 func _init() -> void:
@@ -72,6 +84,11 @@ func to_dict() -> Dictionary:
 		"cultivation": cultivation,
 		"spirit_stones": spirit_stones,
 		"elements": elements,
+		"inventory": inventory,
+		"fabao": fabao,
+		"techniques": techniques,
+		"active_gongfa": active_gongfa,
+		"pills": pills,
 	}
 
 
@@ -89,4 +106,15 @@ static func from_dict(d: Dictionary) -> PlayerData:
 	if elems is Dictionary:
 		for e in ELEMENTS:
 			p.elements[e] = int(elems.get(e, 0))
+	# 法宝字段：旧档没有时保持“空背包/未装备”
+	var inv: Dictionary = d.get("inventory", {})
+	p.inventory = inv if inv is Dictionary else {}
+	p.fabao = str(d.get("fabao", ""))
+	# 功法字段：旧档没有时保持“未习得/未主修”
+	var techn: Dictionary = d.get("techniques", {})
+	p.techniques = techn if techn is Dictionary else {}
+	p.active_gongfa = str(d.get("active_gongfa", ""))
+	# 丹药字段：旧档没有时保持空背包
+	var pl: Dictionary = d.get("pills", {})
+	p.pills = pl if pl is Dictionary else {}
 	return p
